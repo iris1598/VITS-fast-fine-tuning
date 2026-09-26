@@ -16,6 +16,13 @@ lang2token = {
     "en": "[EN]",
 }
 
+AUDIO_EXT = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".opus"}
+
+# Whisper always works on a 30 second window (`pad_or_trim`). Clips up to this
+# length are transcribed in full; longer ones would silently lose content, so
+# they are reported instead of being fed in half-empty.
+WHISPER_WINDOW = 30.0
+
 
 def transcribe_one(model, audio_path):
     """Transcribe a <=30s clip with Whisper."""
@@ -29,14 +36,28 @@ def transcribe_one(model, audio_path):
     # detect the spoken language
     _, probs = model.detect_language(mel)
     lang = max(probs, key=probs.get)
-    print(f"Detected language: {lang}")
 
     # decode the audio
     options = whisper.DecodingOptions(beam_size=5)
     result = whisper.decode(model, mel, options)
 
-    print(result.text)
     return lang, result.text
+
+
+def list_speaker_dirs(parent_dir):
+    """Immediate sub-directories of ``parent_dir`` that actually hold audio."""
+    if not os.path.isdir(parent_dir):
+        return []
+    out = []
+    for name in sorted(os.listdir(parent_dir)):
+        path = os.path.join(parent_dir, name)
+        if not os.path.isdir(path) or name.startswith("."):
+            continue
+        audio = [f for f in sorted(os.listdir(path))
+                 if os.path.splitext(f)[1].lower() in AUDIO_EXT]
+        if audio:
+            out.append((name, audio))
+    return out
 
 
 if __name__ == "__main__":
@@ -54,52 +75,82 @@ if __name__ == "__main__":
         print("WARNING: no GPU detected. Whisper will run on CPU and will be slow; "
               "consider --whisper_size small or medium.")
     model = whisper.load_model(args.whisper_size)
+
     parent_dir = "./custom_character_voice/"
-    if not os.path.isdir(parent_dir):
-        print(f"{parent_dir} does not exist — did you upload a zip of short audios?")
-        speaker_names = []
-    else:
-        speaker_names = list(os.walk(parent_dir))[0][1]
-    speaker_annos = []
-    total_files = sum([len(files) for r, d, files in os.walk(parent_dir)])
-    # 2023/4/21: Get the target sampling rate
+    speakers = list_speaker_dirs(parent_dir)
+
     with open("./configs/finetune_speaker.json", 'r', encoding='utf-8') as f:
         hps = json.load(f)
     target_sr = hps['data']['sampling_rate']
-    processed_files = 0
-    for speaker in speaker_names:
-        for i, wavfile in enumerate(list(os.walk(parent_dir + speaker))[0][2]):
-            # try to load file as audio
+
+    speaker_annos = []
+    skipped_long = []
+    failed = 0
+
+    if not speakers:
+        print(f"{parent_dir} 下没有找到「角色名/音频」的结构。")
+        print("请先运行：  python scripts/organize_data.py --character <角色名>")
+    else:
+        total = sum(len(files) for _, files in speakers)
+        print(f"找到 {len(speakers)} 个角色，共 {total} 个音频文件\n")
+
+    processed = 0
+    for speaker, wavfiles in speakers:
+        outdir_ok = True
+        for i, wavfile in enumerate(wavfiles):
             if wavfile.startswith("processed_"):
                 continue
+            src = os.path.join(parent_dir, speaker, wavfile)
             try:
-                wav, sr = load_audio(parent_dir + speaker + "/" + wavfile, mono=True)
+                wav, sr = load_audio(src, mono=True)
                 if sr != target_sr:
                     from audio_io import resample as _resample
                     wav = _resample(wav, sr, target_sr)
-                if wav.shape[1] / target_sr > 20:
-                    print(f"{wavfile} is longer than 20s and would be truncated, ignoring\n")
+
+                duration = wav.shape[1] / target_sr
+                if duration > WHISPER_WINDOW:
+                    skipped_long.append((speaker, wavfile, duration))
                     continue
-                save_path = parent_dir + speaker + "/" + f"processed_{i}.wav"
+
+                os.makedirs(os.path.join(parent_dir, speaker), exist_ok=True)
+                save_path = os.path.join(parent_dir, speaker, f"processed_{processed}.wav")
                 save_audio(save_path, wav, target_sr)
-                # transcribe text
+
                 lang, text = transcribe_one(model, save_path)
                 if lang not in list(lang2token.keys()):
-                    print(f"{lang} not supported, ignoring\n")
+                    print(f"  {speaker}/{wavfile}: 语言 {lang} 不受支持，跳过")
                     continue
                 text = lang2token[lang] + text + lang2token[lang] + "\n"
                 speaker_annos.append(save_path + "|" + speaker + "|" + text)
 
-                processed_files += 1
-                print(f"Processed: {processed_files}/{total_files}")
+                processed += 1
+                print(f"  [{processed}] {speaker}/{wavfile} ({duration:.1f}s, {lang}) "
+                      f"-> {text.strip()[:48]}")
             except Exception as exc:  # noqa: BLE001 - keep going through the batch
-                print(f"Skipping {wavfile}: {exc!r}")
-                continue
+                failed += 1
+                print(f"  ! {speaker}/{wavfile}: {exc!r}")
 
-    # write into annotation
+    # --- report -----------------------------------------------------------
+    print()
+    if skipped_long:
+        print(f"⚠️ {len(skipped_long)} 个文件超过 {WHISPER_WINDOW:.0f} 秒，未处理：")
+        for speaker, name, dur in skipped_long[:10]:
+            print(f"    {speaker}/{name}  ({dur:.1f}s)")
+        if len(skipped_long) > 10:
+            print(f"    ... 其余 {len(skipped_long) - 10} 个")
+        print("  这些放进 custom_character_voice/ 会被 Whisper 截断、且转写文本超过")
+        print("  preprocess_v2.py 的 150 字上限而被丢弃。如需使用，请改放到 raw_audio/：")
+        print("    mv ./custom_character_voice/<角色>/<文件> ./raw_audio/<角色>_0.wav")
+        print("  然后让 STEP 3 的 long_audio_transcribe.py 去自动切分标注。")
+    if failed:
+        print(f"⚠️ {failed} 个文件读取/转写失败（已在上面逐条列出原因）")
+
     if len(speaker_annos) == 0:
         print("Warning: no short audios found, this IS expected if you have only uploaded long audios, videos or video links.")
         print("this IS NOT expected if you have uploaded a zip file of short audios. Please check your file structure or make sure your audio language is supported.")
+    else:
+        print(f"✅ 共标注 {len(speaker_annos)} 条短音频 -> short_character_anno.txt")
+
     with open("short_character_anno.txt", 'w', encoding='utf-8') as f:
         for line in speaker_annos:
             f.write(line)

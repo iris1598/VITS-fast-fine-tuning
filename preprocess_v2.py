@@ -40,9 +40,11 @@ def main():
             new_annos += long_character_anno
 
     # Get all speaker names
+    # NOTE: do NOT name this loop variable `text` — it would shadow the `text`
+    # module imported below and break `text._clean_text(...)` further down.
     speakers = []
     for line in new_annos:
-        path, speaker, text = line.split("|")
+        path, speaker, txt = line.split("|")
         if speaker not in speakers:
             speakers.append(speaker)
     assert (len(speakers) != 0), "No audio file found. Please check your uploaded file structure."
@@ -72,7 +74,7 @@ def main():
                     filtered_old_annos.append(line)
         old_annos = filtered_old_annos
         for line in old_annos:
-            path, speaker, text = line.split("|")
+            path, speaker, txt = line.split("|")
             if speaker not in speakers:
                 speakers.append(speaker)
         num_old_voices = len(old_annos)
