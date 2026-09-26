@@ -1,6 +1,16 @@
 import re
 from unidecode import unidecode
-import pyopenjtalk
+
+try:
+    import pyopenjtalk
+except ImportError as _exc:  # pragma: no cover - depends on the install
+    raise ImportError(
+        "Japanese text processing needs OpenJTalk bindings.\n"
+        "Install the maintained fork with prebuilt wheels:\n"
+        "    pip install pyopenjtalk-plus\n"
+        "(the original 'pyopenjtalk-prebuilt' has no wheels for Python 3.12+ "
+        "and needs a C/C++ toolchain to build)."
+    ) from _exc
 
 
 # Regular expression matching Japanese without punctuation marks:
@@ -93,7 +103,7 @@ def japanese_to_romaji_with_accent(text):
                 a1 = int(re.search(r"/A:(\-?[0-9]+)\+", label).group(1))
                 a2 = int(re.search(r"\+(\d+)\+", label).group(1))
                 a3 = int(re.search(r"\+(\d+)/", label).group(1))
-                if re.search(r'\-([^\+]*)\+', labels[n + 1]).group(1) in ['sil', 'pau']:
+                if n + 1 >= len(labels) or re.search(r'\-([^\+]*)\+', labels[n + 1]).group(1) in ['sil', 'pau']:
                     a2_next = -1
                 else:
                     a2_next = int(

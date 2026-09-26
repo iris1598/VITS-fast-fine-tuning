@@ -1,5 +1,21 @@
 English Documentation Please Click [here](https://github.com/Plachtaa/VITS-fast-fine-tuning/blob/main/README.md)
 # VITS 快速微调
+
+> **⚠️ 2026 更新**
+> 本项目原始代码面向 Python 3.8 / PyTorch 2.1 / NumPy 1.22。
+> 当前环境（Colab：Python 3.12 / NumPy 2.x / PyTorch 2.11+）下旧代码与旧 notebook 已无法运行。
+> 仓库内的代码、`requirements.txt` 与 `VITS-fast-finetuning.ipynb` 均已更新至 2026 年可用状态。
+>
+> * 环境搭建与改动清单：**[SETUP_2026.md](SETUP_2026.md)**
+> * 本地运行完整流程：**[LOCAL.md](LOCAL.md)**
+> * 装完环境后建议先跑一次自检：`python scripts/verify_install.py`
+>
+> 已修复的主要问题：`distutils` 在 Python 3.12 被移除导致 `monotonic_align` 编译失败、
+> librosa 关键字参数变更、`torch.stft` 的 `return_complex` 废弃、
+> matplotlib 3.10 移除 `tostring_rgb`、torchaudio 2.9 改用 TorchCodec、
+> Gradio 5 组件 API 变更、`pyopenjtalk-prebuilt` 无 3.12+ 轮子、
+> 以及可选语言包缺失会导致 `import text` 整体崩溃等问题。
+
 这个代码库会指导你如何将自定义角色（甚至你自己），加入预训练的VITS模型中，在1小时内的微调使模型具备如下功能：  
 1. 在 模型所包含的任意两个角色 之间进行声线转换
 2. 以 你加入的角色声线 进行中日英三语 文本到语音合成。  

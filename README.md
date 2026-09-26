@@ -1,5 +1,23 @@
 [中文文档请点击这里](https://github.com/Plachtaa/VITS-fast-fine-tuning/blob/main/README_ZH.md)
 # VITS Fast Fine-tuning
+
+> **⚠️ 2026 update**
+> This project originally targeted Python 3.8 / PyTorch 2.1 / NumPy 1.22.
+> On today's stack (Colab: Python 3.12 / NumPy 2.x / PyTorch 2.11+) the old code and
+> the old notebook no longer run. The source, `requirements.txt` and
+> `VITS-fast-finetuning.ipynb` have all been brought up to date.
+>
+> * Environment setup & full change list: **[SETUP_2026.md](SETUP_2026.md)**
+> * Full local walkthrough: **[LOCAL.md](LOCAL.md)**
+> * After installing, run the self-check: `python scripts/verify_install.py`
+>
+> Highlights of the fixes: `distutils` removal in Python 3.12 breaking the
+> `monotonic_align` build, librosa keyword-only `mel()`, deprecated
+> `torch.stft(return_complex=False)`, matplotlib 3.10 dropping `tostring_rgb`,
+> torchaudio 2.9 moving I/O onto TorchCodec, Gradio 5 component API changes,
+> `pyopenjtalk-prebuilt` having no 3.12+ wheels, and a missing optional language
+> package breaking `import text` entirely.
+
 This repo will guide you to add your own character voices, or even your own voice, into existing VITS TTS model
 to make it able to do the following tasks in less than 1 hour:  
 

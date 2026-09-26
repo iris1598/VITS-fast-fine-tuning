@@ -1,5 +1,12 @@
 import re
-from indic_transliteration import sanscript
+
+try:
+    from indic_transliteration import sanscript
+except ImportError as _exc:  # pragma: no cover - depends on the install
+    raise ImportError(
+        "Sanskrit text processing needs 'indic_transliteration':\n"
+        "    pip install indic_transliteration"
+    ) from _exc
 
 
 # List of (iast, ipa) pairs:

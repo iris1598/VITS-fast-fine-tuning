@@ -1,6 +1,12 @@
 import torch
 import argparse
 import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from compat import torch_load  # noqa: E402
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -8,7 +14,7 @@ if __name__ == "__main__":
     parser.add_argument("--config_dir", type=str, default="./configs/modified_finetune_speaker.json")
     args = parser.parse_args()
 
-    model_sd = torch.load(args.model_dir, map_location='cpu')
+    model_sd = torch_load(args.model_dir, map_location='cpu')
     with open(args.config_dir, 'r', encoding='utf-8') as f:
         hps = json.load(f)
 
@@ -32,6 +38,5 @@ if __name__ == "__main__":
     hps['speakers'] = valid_speakers
     with open("./moegoe_config.json", 'w', encoding='utf-8') as f:
         json.dump(hps, f, indent=2)
-
-
-
+    print(f"Wrote finetune_speaker.json / moegoe_config.json / G_latest.pth "
+          f"({len(valid_speakers)} speakers)")

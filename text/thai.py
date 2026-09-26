@@ -1,6 +1,12 @@
 import re
-from num_thai.thainumbers import NumThai
 
+try:
+    from num_thai.thainumbers import NumThai
+except ImportError as _exc:  # pragma: no cover - depends on the install
+    raise ImportError(
+        "Thai text processing needs 'num_thai':\n"
+        "    pip install num_thai"
+    ) from _exc
 
 num = NumThai()
 

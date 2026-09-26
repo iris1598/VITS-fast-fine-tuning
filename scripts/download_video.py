@@ -1,11 +1,25 @@
 import os
 import random
 import shutil
+import sys
 from concurrent.futures import ThreadPoolExecutor
-from google.colab import files
 import subprocess
 
+try:
+    from google.colab import files
+except ImportError:  # running outside Colab
+    files = None
+
 basepath = os.getcwd()
+if files is None:
+    print(
+        "This script opens an interactive file-upload widget, which only "
+        "exists inside Google Colab.\n"
+        "When running locally, write the speaker|video_url pairs into "
+        "./speaker_links.txt and run the download part directly."
+    )
+    sys.exit(1)
+
 uploaded = files.upload()  # 上传文件
 for filename in uploaded.keys():
     assert (filename.endswith(".txt")), "speaker-videolink info could only be .txt file!"
@@ -27,11 +41,10 @@ def generate_infos():
 
 
 def download_video(info):
-
     link = info["link"]
     filename = info["filename"]
     print(f"Starting download for:\nFilename: {filename}\nLink: {link}")
-    
+
     try:
         result = subprocess.run(
             ["yt-dlp", "-f", "30280", link, "-o", f"./video_data/{filename}.mp4", "--no-check-certificate"],
@@ -46,6 +59,9 @@ def download_video(info):
 
 
 if __name__ == "__main__":
+    os.makedirs("./video_data", exist_ok=True)
     infos = generate_infos()
+    if not infos:
+        print("speaker_links.txt did not contain any 'speaker|url' lines.")
     with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-        executor.map(download_video, infos)
+        list(executor.map(download_video, infos))

@@ -1,0 +1,28 @@
+# ============================================================================
+# VITS-fast-fine-tuning — data preparation dependencies
+# ============================================================================
+# Needed only for STEP 3 of the notebook (turning raw audio/video into training
+# data). Installed separately from requirements.txt on purpose: Demucs and
+# Whisper are heavy, and a broken one of them should not stop you from
+# training on data you already prepared.
+#
+#   pip install -r requirements-data.txt
+#
+# Requires ffmpeg on PATH (`apt-get install -y ffmpeg` on Colab, `brew install
+# ffmpeg` on macOS, or a build from ffmpeg.org on Windows).
+# ============================================================================
+
+# Automatic transcription + language detection
+openai-whisper>=20240930
+
+# Background music / noise removal
+demucs>=4.0.1
+
+# Video -> audio extraction (moviepy 2.x)
+moviepy>=2.0
+
+# Downloading videos from links (bilibili/youtube)
+yt-dlp
+
+# Needed by torchaudio >= 2.9 backends and by Demucs' own I/O
+torchcodec

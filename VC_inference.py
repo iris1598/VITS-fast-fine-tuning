@@ -4,12 +4,11 @@ import torch
 from torch import no_grad, LongTensor
 import argparse
 import commons
+from audio_io import resample as _resample
 from mel_processing import spectrogram_torch
 import utils
 from models import SynthesizerTrn
 import gradio as gr
-import librosa
-import webbrowser
 
 from text import text_to_sequence, _clean_text
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -28,12 +27,43 @@ language_marks = {
     "Mix": "",
 }
 lang = ['日本語', '简体中文', 'English', 'Mix']
+
+
 def get_text(text, hps, is_symbol):
     text_norm = text_to_sequence(text, hps.symbols, [] if is_symbol else hps.data.text_cleaners)
     if hps.data.add_blank:
         text_norm = commons.intersperse(text_norm, 0)
     text_norm = LongTensor(text_norm)
     return text_norm
+
+
+def _in_colab():
+    return "google.colab" in os.environ.get("JPY_PARENT_PID", "") or os.path.isdir("/content")
+
+
+def record_audio_to_array(audio):
+    """Normalise whatever gradio hands us into float32 samples in [-1, 1].
+
+    Gradio used to return int16 numpy arrays; since gradio 4 `type="numpy"`
+    yields float32 already scaled to [-1, 1].  ``np.iinfo`` blows up on float
+    dtypes, so detect the dtype instead of assuming int16.
+    """
+    if isinstance(audio, tuple):  # (sample_rate, samples)
+        audio = audio[1]
+    audio = np.asarray(audio)
+    if np.issubdtype(audio.dtype, np.integer):
+        info = np.iinfo(audio.dtype)
+        audio = audio.astype(np.float32) / float(max(abs(info.min), info.max))
+    else:
+        audio = audio.astype(np.float32)
+        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+        if peak > 1.0:  # some backends hand back un-normalised ints as floats
+            audio = audio / peak
+    if audio.ndim == 2:
+        # gradio returns (samples, channels)
+        audio = audio.mean(axis=1) if audio.shape[1] <= 8 else audio.mean(axis=0)
+    return np.ascontiguousarray(audio, dtype=np.float32)
+
 
 def create_tts_fn(model, hps, speaker_ids):
     def tts_fn(text, speaker, language, speed):
@@ -52,6 +82,7 @@ def create_tts_fn(model, hps, speaker_ids):
 
     return tts_fn
 
+
 def create_vc_fn(model, hps, speaker_ids):
     def vc_fn(original_speaker, target_speaker, record_audio, upload_audio):
         input_audio = record_audio if record_audio is not None else upload_audio
@@ -61,13 +92,12 @@ def create_vc_fn(model, hps, speaker_ids):
         original_speaker_id = speaker_ids[original_speaker]
         target_speaker_id = speaker_ids[target_speaker]
 
-        audio = (audio / np.iinfo(audio.dtype).max).astype(np.float32)
-        if len(audio.shape) > 1:
-            audio = librosa.to_mono(audio.transpose(1, 0))
+        audio = record_audio_to_array(audio)
         if sampling_rate != hps.data.sampling_rate:
-            audio = librosa.resample(audio, orig_sr=sampling_rate, target_sr=hps.data.sampling_rate)
+            audio = _resample(torch.from_numpy(audio).unsqueeze(0),
+                              sampling_rate, hps.data.sampling_rate)[0].numpy()
         with no_grad():
-            y = torch.FloatTensor(audio)
+            y = torch.FloatTensor(np.ascontiguousarray(audio))
             y = y / max(-y.min(), y.max()) / 0.99
             y = y.to(device)
             y = y.unsqueeze(0)
@@ -83,15 +113,10 @@ def create_vc_fn(model, hps, speaker_ids):
         return "Success", (hps.data.sampling_rate, audio)
 
     return vc_fn
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_dir", default="./G_latest.pth", help="directory to your fine-tuned model")
-    parser.add_argument("--config_dir", default="./finetune_speaker.json", help="directory to your model config file")
-    parser.add_argument("--share", default=False, help="make link public (used in colab)")
 
-    args = parser.parse_args()
-    hps = utils.get_hparams_from_file(args.config_dir)
 
+def build_app(model_dir, config_dir):
+    hps = utils.get_hparams_from_file(config_dir)
 
     net_g = SynthesizerTrn(
         len(hps.symbols),
@@ -101,19 +126,20 @@ if __name__ == "__main__":
         **hps.model).to(device)
     _ = net_g.eval()
 
-    _ = utils.load_checkpoint(args.model_dir, net_g, None)
+    _ = utils.load_checkpoint(model_dir, net_g, None)
     speaker_ids = hps.speakers
     speakers = list(hps.speakers.keys())
     tts_fn = create_tts_fn(net_g, hps, speaker_ids)
     vc_fn = create_vc_fn(net_g, hps, speaker_ids)
-    app = gr.Blocks()
+
+    app = gr.Blocks(title="VITS fast fine-tuning")
     with app:
         with gr.Tab("Text-to-Speech"):
             with gr.Row():
                 with gr.Column():
-                    textbox = gr.TextArea(label="Text",
-                                          placeholder="Type your sentence here",
-                                          value="こんにちわ。", elem_id=f"tts-input")
+                    textbox = gr.Textbox(label="Text",
+                                         placeholder="Type your sentence here",
+                                         value="こんにちわ。", lines=3, elem_id="tts-input")
                     # select character
                     char_dropdown = gr.Dropdown(choices=speakers, value=speakers[0], label='character')
                     language_dropdown = gr.Dropdown(choices=lang, value=lang[0], label='language')
@@ -131,8 +157,9 @@ if __name__ == "__main__":
                             录制或上传声音，并选择要转换的音色。
             """)
             with gr.Column():
-                record_audio = gr.Audio(label="record your voice", source="microphone")
-                upload_audio = gr.Audio(label="or upload audio here", source="upload")
+                # gradio 4 renamed `source=` to `sources=[...]`
+                record_audio = gr.Audio(label="record your voice", sources=["microphone"], type="numpy")
+                upload_audio = gr.Audio(label="or upload audio here", sources=["upload"], type="numpy")
                 source_speaker = gr.Dropdown(choices=speakers, value=speakers[0], label="source speaker")
                 target_speaker = gr.Dropdown(choices=speakers, value=speakers[0], label="target speaker")
             with gr.Column():
@@ -141,6 +168,26 @@ if __name__ == "__main__":
             btn = gr.Button("Convert!")
             btn.click(vc_fn, inputs=[source_speaker, target_speaker, record_audio, upload_audio],
                       outputs=[message_box, converted_audio])
-    webbrowser.open("http://127.0.0.1:7860")
-    app.launch(share=args.share)
+    return app
 
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_dir", default="./G_latest.pth", help="directory to your fine-tuned model")
+    parser.add_argument("--config_dir", default="./finetune_speaker.json", help="directory to your model config file")
+    parser.add_argument("--share", default=False, type=utils.str2bool, nargs="?", const=True,
+                        help="make link public (used in colab)")
+    parser.add_argument("--server_name", default="127.0.0.1", help="bind address")
+
+    args = parser.parse_args()
+
+    app = build_app(args.model_dir, args.config_dir)
+
+    if not _in_colab():
+        try:
+            import webbrowser
+            webbrowser.open(f"http://{args.server_name}:7860")
+        except Exception:  # noqa: BLE001 - headless machines have no browser
+            pass
+
+    app.launch(share=args.share, server_name=args.server_name)

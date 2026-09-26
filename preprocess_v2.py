@@ -2,19 +2,31 @@ import os
 import argparse
 import json
 import sys
+
 sys.setrecursionlimit(500000)  # Fix the error message of RecursionError: maximum recursion depth exceeded while calling a Python object.  You can change the number as you want.
 
-if __name__ == "__main__":
+from utils import str2bool
+
+
+def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--add_auxiliary_data", type=bool, help="Whether to add extra data as fine-tuning helper")
+    # NOTE: `type=bool` used to be used here, which made `--add_auxiliary_data
+    # False` evaluate to True (any non-empty string is truthy).  str2bool
+    # parses the value properly.
+    parser.add_argument("--add_auxiliary_data", type=str2bool, nargs="?", const=True,
+                        default=False, help="Whether to add extra data as fine-tuning helper")
     parser.add_argument("--languages", default="CJE")
     args = parser.parse_args()
+
     if args.languages == "CJE":
         langs = ["[ZH]", "[JA]", "[EN]"]
     elif args.languages == "CJ":
         langs = ["[ZH]", "[JA]"]
     elif args.languages == "C":
         langs = ["[ZH]"]
+    else:
+        raise ValueError(f"Unknown --languages {args.languages!r}; expected one of CJE / CJ / C")
+
     new_annos = []
     # Source 1: transcribed short audios
     if os.path.exists("short_character_anno.txt"):
@@ -34,7 +46,21 @@ if __name__ == "__main__":
         if speaker not in speakers:
             speakers.append(speaker)
     assert (len(speakers) != 0), "No audio file found. Please check your uploaded file structure."
-    # Source 3 (Optional): sampled audios as extra training helpers
+
+    # Load the base config once
+    with open("./configs/finetune_speaker.json", 'r', encoding='utf-8') as f:
+        hps = json.load(f)
+
+    # Make sure every cleaner the config asks for is actually installed.  The
+    # text frontends are imported lazily, so without this check a missing
+    # backend would only blow up in the middle of the annotation pass.
+    import text
+    missing = text.check_cleaners(hps['data']['text_cleaners'])
+    if missing:
+        print("ERROR: the configured text cleaner cannot run:\n  " + "\n  ".join(missing))
+        print("Install the missing backend(s) and re-run this step.")
+        sys.exit(1)
+
     if args.add_auxiliary_data:
         with open("./sampled_audio4ft.txt", 'r', encoding='utf-8') as f:
             old_annos = f.readlines()
@@ -56,30 +82,21 @@ if __name__ == "__main__":
         if cc_duplicate == 0:
             cc_duplicate = 1
 
-
         # STEP 2: modify config file
-        with open("./configs/finetune_speaker.json", 'r', encoding='utf-8') as f:
-            hps = json.load(f)
-
-        # assign ids to new speakers
         speaker2id = {}
         for i, speaker in enumerate(speakers):
             speaker2id[speaker] = i
-        # modify n_speakers
         hps['data']["n_speakers"] = len(speakers)
-        # overwrite speaker names
         hps['speakers'] = speaker2id
         hps['train']['log_interval'] = 10
         hps['train']['eval_interval'] = 100
         hps['train']['batch_size'] = 16
         hps['data']['training_files'] = "final_annotation_train.txt"
         hps['data']['validation_files'] = "final_annotation_val.txt"
-        # save modified config
         with open("./configs/modified_finetune_speaker.json", 'w', encoding='utf-8') as f:
             json.dump(hps, f, indent=2)
 
         # STEP 3: clean annotations, replace speaker names with assigned speaker IDs
-        import text
         cleaned_new_annos = []
         for i, line in enumerate(new_annos):
             path, speaker, txt = line.split("|")
@@ -98,11 +115,9 @@ if __name__ == "__main__":
             cleaned_old_annos.append(path + "|" + str(speaker2id[speaker]) + "|" + cleaned_text)
         # merge with old annotation
         final_annos = cleaned_old_annos + cc_duplicate * cleaned_new_annos
-        # save annotation file
         with open("./final_annotation_train.txt", 'w', encoding='utf-8') as f:
             for line in final_annos:
                 f.write(line)
-        # save annotation file for validation
         with open("./final_annotation_val.txt", 'w', encoding='utf-8') as f:
             for line in cleaned_new_annos:
                 f.write(line)
@@ -110,23 +125,16 @@ if __name__ == "__main__":
     else:
         # Do not add extra helper data
         # STEP 1: modify config file
-        with open("./configs/finetune_speaker.json", 'r', encoding='utf-8') as f:
-            hps = json.load(f)
-
-        # assign ids to new speakers
         speaker2id = {}
         for i, speaker in enumerate(speakers):
             speaker2id[speaker] = i
-        # modify n_speakers
         hps['data']["n_speakers"] = len(speakers)
-        # overwrite speaker names
         hps['speakers'] = speaker2id
         hps['train']['log_interval'] = 10
         hps['train']['eval_interval'] = 100
         hps['train']['batch_size'] = 16
         hps['data']['training_files'] = "final_annotation_train.txt"
         hps['data']['validation_files'] = "final_annotation_val.txt"
-        # save modified config
         with open("./configs/modified_finetune_speaker.json", 'w', encoding='utf-8') as f:
             json.dump(hps, f, indent=2)
 
@@ -143,12 +151,14 @@ if __name__ == "__main__":
             cleaned_new_annos.append(path + "|" + str(speaker2id[speaker]) + "|" + cleaned_text)
 
         final_annos = cleaned_new_annos
-        # save annotation file
         with open("./final_annotation_train.txt", 'w', encoding='utf-8') as f:
             for line in final_annos:
                 f.write(line)
-        # save annotation file for validation
         with open("./final_annotation_val.txt", 'w', encoding='utf-8') as f:
             for line in cleaned_new_annos:
                 f.write(line)
         print("finished")
+
+
+if __name__ == "__main__":
+    main()

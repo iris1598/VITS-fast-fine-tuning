@@ -4,9 +4,9 @@ import random
 import numpy as np
 import torch
 import torch.utils.data
-import torchaudio
 
 import commons
+from audio_io import load_audio
 from mel_processing import spectrogram_torch
 from utils import load_wav_to_torch, load_filepaths_and_text
 from text import text_to_sequence, cleaned_text_to_sequence
@@ -69,40 +69,40 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         return (text, spec, wav, sid)
 
     def get_audio(self, filename):
-        # audio, sampling_rate = load_wav_to_torch(filename)
-        # if sampling_rate != self.sampling_rate:
-        #     raise ValueError("{} {} SR doesn't match target {} SR".format(
-        #         sampling_rate, self.sampling_rate))
-        # audio_norm = audio / self.max_wav_value if audio.max() > 10 else audio
-        # audio_norm = audio_norm.unsqueeze(0)
-        audio_norm, sampling_rate = torchaudio.load(filename, frame_offset=0, num_frames=-1, normalize=True, channels_first=True)
-        # spec_filename = filename.replace(".wav", ".spec.pt")
-        # if os.path.exists(spec_filename):
-        #     spec = torch.load(spec_filename)
-        # else:
-        #     try:
+        # soundfile-backed loader; see audio_io.py for why torchaudio.load was
+        # dropped (its I/O layer moved to TorchCodec and the `normalize`
+        # argument is no longer honoured).
+        audio_norm, sampling_rate = load_audio(filename, target_sr=self.sampling_rate, mono=True)
+        if sampling_rate != self.sampling_rate:
+            raise ValueError("{} {} SR doesn't match target {} SR".format(
+                sampling_rate, filename, self.sampling_rate))
         spec = spectrogram_torch(audio_norm, self.filter_length,
                                  self.sampling_rate, self.hop_length, self.win_length,
                                  center=False)
         spec = spec.squeeze(0)
-            # except NotImplementedError:
-            #     print("?")
-            # spec = torch.squeeze(spec, 0)
-            # torch.save(spec, spec_filename)
         return spec, audio_norm
 
     def get_text(self, text):
         if self.cleaned_text:
             text_norm = cleaned_text_to_sequence(text, self.symbols)
         else:
-            text_norm = text_to_sequence(text, self.text_cleaners)
+            text_norm = text_to_sequence(text, self.symbols, self.text_cleaners)
         if self.add_blank:
             text_norm = commons.intersperse(text_norm, 0)
         text_norm = torch.LongTensor(text_norm)
         return text_norm
 
     def get_sid(self, sid):
-        sid = torch.LongTensor([int(sid)])
+        try:
+            sid = torch.LongTensor([int(sid)])
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"Speaker id {sid!r} is not an integer. Training annotation files must "
+                "use numeric speaker ids in the form 'path|speaker_id|text'; the mapping "
+                "from speaker names to ids lives in the config's `speakers` field and is "
+                "written by preprocess_v2.py. Check the file referenced by "
+                "data.training_files."
+            ) from exc
         return sid
 
     def __getitem__(self, index):

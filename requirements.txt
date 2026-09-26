@@ -1,26 +1,62 @@
-Cython==0.29.21
-librosa==0.9.2
-matplotlib==3.3.1
-scikit-learn==1.0.2
-scipy
-numpy==1.22
-tensorboard
-torch==2.1.2
-torchvision==0.16.2
-torchaudio==2.1.2
+# ============================================================================
+# VITS-fast-fine-tuning — core dependencies (training + inference)
+# ============================================================================
+# Updated for the 2026 stack: Python 3.12 / NumPy 2.x / PyTorch 2.4+.
+# Everything below has cp312 wheels, so no compiler is needed.
+#
+# PyTorch itself is intentionally NOT listed here:
+#   * On Google Colab a CUDA-enabled PyTorch is already installed. Reinstalling
+#     it from PyPI would replace that build and slow down / break training.
+#   * Locally, install the build that matches your machine first:
+#         pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+#         (or .../whl/cpu for a CPU-only machine)
+# Check it with:  python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+# ============================================================================
+
+# --- numerics / audio -------------------------------------------------------
+numpy>=1.26,<3
+scipy>=1.11
+librosa>=0.10.2
+soundfile>=0.12.1
+matplotlib>=3.8
+tensorboard>=2.15
+tqdm
+
+# --- build tooling (monotonic_align Cython extension) -----------------------
+# distutils was removed from the stdlib in Python 3.12, so we need a modern
+# setuptools + Cython 3 toolchain.
+setuptools>=68
+wheel
+Cython>=3.0
+packaging
+
+# --- text frontends ---------------------------------------------------------
+regex
 unidecode
-pyopenjtalk-prebuilt
-jamo
 pypinyin
 jieba
-protobuf
 cn2an
 inflect
 eng_to_ipa
+jamo
 ko_pron
-indic_transliteration==2.3.37
-num_thai==0.0.5
-opencc==1.1.1
-demucs
-git+https://github.com/openai/whisper.git 
-gradio
+# Maintained OpenJTalk fork with prebuilt wheels for Python 3.9-3.13.
+# It still installs the `pyopenjtalk` import name, so no code changes needed.
+# (The original `pyopenjtalk-prebuilt` has no wheels for 3.12+ and must be
+# built from source with CMake + MSVC.)
+pyopenjtalk-plus>=0.3.4
+
+# --- web UI -----------------------------------------------------------------
+gradio>=4.44
+
+# --- optional language frontends -------------------------------------------
+# Only needed if your config's `data.text_cleaners` uses them. They are
+# imported lazily, so a missing one no longer breaks Chinese/Japanese models.
+#   pip install num_thai                # Thai  (thai_cleaners)
+#   pip install indic_transliteration   # Sanskrit (sanskrit_cleaners / cjks_cleaners)
+
+
+# --- upstream training data -----------------------------------------------
+# The trilingual pretrained checkpoint is distributed together with a small
+# auxiliary dataset used when ADD_AUXILIARY = True:
+#   https://huggingface.co/datasets/Plachta/sampled_audio4ft/resolve/main/sampled_audio4ft_v2.zip

@@ -3,6 +3,7 @@ import json
 import argparse
 import itertools
 import math
+import socket
 import torch
 from torch import nn, optim
 from torch.nn import functional as F
@@ -11,7 +12,6 @@ from torch.utils.tensorboard import SummaryWriter
 import torch.multiprocessing as mp
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 
 import librosa
@@ -21,6 +21,8 @@ logging.getLogger('numba').setLevel(logging.WARNING)
 
 import commons
 import utils
+from compat import autocast, make_grad_scaler, silence_known_warnings
+import monotonic_align
 from data_utils import (
   TextAudioSpeakerLoader,
   TextAudioSpeakerCollate,
@@ -42,17 +44,56 @@ from mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 torch.backends.cudnn.benchmark = True
 global_step = 0
 
+# AMP is only meaningful on CUDA.  Keeping this in one place avoids handing
+# fp16 tensors to a CPU-only build.
+USE_AMP = False
+
+
+def _find_free_port():
+  """Pick a free localhost port so parallel runs don't collide on 8000."""
+  with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    s.bind(("127.0.0.1", 0))
+    return s.getsockname()[1]
+
+
+def _device(rank):
+  """The device a given process should use."""
+  if torch.cuda.is_available():
+    return torch.device("cuda", rank)
+  return torch.device("cpu")
+
 
 def main():
   """Assume Single Node Multi GPUs Training Only"""
-  assert torch.cuda.is_available(), "CPU training is not allowed."
-
-  n_gpus = torch.cuda.device_count()
-  os.environ['MASTER_ADDR'] = 'localhost'
-  os.environ['MASTER_PORT'] = '8000'
+  global USE_AMP
+  silence_known_warnings()
 
   hps = utils.get_hparams()
-  mp.spawn(run, nprocs=n_gpus, args=(n_gpus, hps,))
+
+  n_gpus = torch.cuda.device_count()
+  if n_gpus == 0:
+    print(
+      "=" * 72 + "\n"
+      "WARNING: no CUDA device detected.\n"
+      "Falling back to single-process CPU training. This is only practical for\n"
+      "smoke tests / very small datasets — it is orders of magnitude slower.\n"
+      + "=" * 72
+    )
+  elif n_gpus > 1:
+    print(f"Found {n_gpus} CUDA devices, launching distributed training.")
+  else:
+    print("Found 1 CUDA device, launching single-GPU training.")
+
+  USE_AMP = bool(hps.train.fp16_run) and torch.cuda.is_available()
+  if hps.train.fp16_run and not torch.cuda.is_available():
+    print("NOTE: train.fp16_run is enabled in the config but no GPU is present; "
+          "running in fp32.")
+
+  nprocs = max(1, n_gpus)
+  os.environ["MASTER_ADDR"] = "localhost"
+  os.environ.setdefault("MASTER_PORT", str(_find_free_port()))
+
+  mp.spawn(run, nprocs=nprocs, args=(nprocs, hps,))
 
 
 def run(rank, n_gpus, hps):
@@ -64,11 +105,20 @@ def run(rank, n_gpus, hps):
     utils.check_git_hash(hps.model_dir)
     writer = SummaryWriter(log_dir=hps.model_dir)
     writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
+    logger.info("monotonic_align backend: %s", monotonic_align.backend_name())
 
-  # Use gloo backend on Windows for Pytorch
-  dist.init_process_group(backend=  'gloo' if os.name == 'nt' else 'nccl', init_method='env://', world_size=n_gpus, rank=rank)
+  device = _device(rank)
+
+  # Use gloo on Windows (no NCCL) and on CPU-only machines.
+  if torch.cuda.is_available() and os.name != 'nt':
+    backend = 'nccl'
+  else:
+    backend = 'gloo'
+  dist.init_process_group(backend=backend, init_method='env://',
+                          world_size=n_gpus, rank=rank)
   torch.manual_seed(hps.train.seed)
-  torch.cuda.set_device(rank)
+  if torch.cuda.is_available():
+    torch.cuda.set_device(rank)
 
   train_dataset = TextAudioSpeakerLoader(hps.data.training_files, hps.data, symbols)
   train_sampler = DistributedBucketSampler(
@@ -79,23 +129,26 @@ def run(rank, n_gpus, hps):
       rank=rank,
       shuffle=True)
   collate_fn = TextAudioSpeakerCollate()
-  train_loader = DataLoader(train_dataset, num_workers=2, shuffle=False, pin_memory=True,
+  # num_workers>0 needs the dataset to be picklable and can be fragile on
+  # Windows; keep the original behaviour on Linux, be conservative elsewhere.
+  num_workers = 2 if os.name != 'nt' else 0
+  train_loader = DataLoader(train_dataset, num_workers=num_workers, shuffle=False, pin_memory=True,
       collate_fn=collate_fn, batch_sampler=train_sampler)
-  # train_loader = DataLoader(train_dataset, batch_size=hps.train.batch_size, num_workers=2, shuffle=False, pin_memory=True,
-  #                           collate_fn=collate_fn)
   if rank == 0:
     eval_dataset = TextAudioSpeakerLoader(hps.data.validation_files, hps.data, symbols)
     eval_loader = DataLoader(eval_dataset, num_workers=0, shuffle=False,
         batch_size=hps.train.batch_size, pin_memory=True,
         drop_last=False, collate_fn=collate_fn)
+  else:
+    eval_loader = None
 
   net_g = SynthesizerTrn(
       len(symbols),
       hps.data.filter_length // 2 + 1,
       hps.train.segment_size // hps.data.hop_length,
       n_speakers=hps.data.n_speakers,
-      **hps.model).cuda(rank)
-  net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(rank)
+      **hps.model).to(device)
+  net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).to(device)
 
   # load existing model
   if hps.cont:
@@ -103,8 +156,8 @@ def run(rank, n_gpus, hps):
           _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "G_latest.pth"), net_g, None)
           _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "D_latest.pth"), net_d, None)
           global_step = (epoch_str - 1) * len(train_loader)
-      except:
-          print("Failed to find latest checkpoint, loading G_0.pth...")
+      except Exception as e:
+          print(f"Failed to find latest checkpoint ({e}), loading G_0.pth...")
           if hps.train_with_pretrained_model:
               print("Train with pretrained model...")
               _, _, _, epoch_str = utils.load_checkpoint("./pretrained_models/G_0.pth", net_g, None)
@@ -127,9 +180,6 @@ def run(rank, n_gpus, hps):
       p.requires_grad = True
   for p in net_d.parameters():
       p.requires_grad = True
-  # for p in net_d.parameters():
-  #     p.requires_grad = False
-  # net_g.emb_g.weight.requires_grad = True
   optim_g = torch.optim.AdamW(
       net_g.parameters(),
       hps.train.learning_rate,
@@ -140,25 +190,38 @@ def run(rank, n_gpus, hps):
       hps.train.learning_rate,
       betas=hps.train.betas,
       eps=hps.train.eps)
-  # optim_d = None
-  net_g = DDP(net_g, device_ids=[rank])
-  net_d = DDP(net_d, device_ids=[rank])
+
+  if torch.cuda.is_available():
+    net_g = DDP(net_g, device_ids=[rank])
+    net_d = DDP(net_d, device_ids=[rank])
+  else:
+    net_g = DDP(net_g)
+    net_d = DDP(net_d)
 
   scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=hps.train.lr_decay)
   scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=hps.train.lr_decay)
 
-  scaler = GradScaler(enabled=hps.train.fp16_run)
+  scaler = make_grad_scaler(enabled=USE_AMP, device_type=device.type)
 
-  for epoch in range(epoch_str, hps.train.epochs + 1):
+  # The shipped configs use a very large `train.epochs` (10000) as an upper
+  # bound; `--max_epochs` is what the user actually controls.
+  total_epochs = min(int(hps.train.epochs), int(hps.max_epochs))
+  print(f"Training from epoch {epoch_str} to {total_epochs}.")
+
+  for epoch in range(epoch_str, total_epochs + 1):
     if rank==0:
-      train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler, [train_loader, eval_loader], logger, [writer, writer_eval])
+      train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler, [train_loader, eval_loader], logger, [writer, writer_eval], device)
     else:
-      train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler, [train_loader, None], None, None)
+      train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler, [train_loader, None], None, None, device)
     scheduler_g.step()
     scheduler_d.step()
 
+  if rank == 0:
+    logger.info("Training finished.")
+  dist.destroy_process_group()
 
-def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers):
+
+def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers, device):
   net_g, net_d = nets
   optim_g, optim_d = optims
   scheduler_g, scheduler_d = schedulers
@@ -166,18 +229,17 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
   if writers is not None:
     writer, writer_eval = writers
 
-  # train_loader.batch_sampler.set_epoch(epoch)
   global global_step
 
   net_g.train()
   net_d.train()
   for batch_idx, (x, x_lengths, spec, spec_lengths, y, y_lengths, speakers) in enumerate(tqdm(train_loader)):
-    x, x_lengths = x.cuda(rank, non_blocking=True), x_lengths.cuda(rank, non_blocking=True)
-    spec, spec_lengths = spec.cuda(rank, non_blocking=True), spec_lengths.cuda(rank, non_blocking=True)
-    y, y_lengths = y.cuda(rank, non_blocking=True), y_lengths.cuda(rank, non_blocking=True)
-    speakers = speakers.cuda(rank, non_blocking=True)
+    x, x_lengths = x.to(device, non_blocking=True), x_lengths.to(device, non_blocking=True)
+    spec, spec_lengths = spec.to(device, non_blocking=True), spec_lengths.to(device, non_blocking=True)
+    y, y_lengths = y.to(device, non_blocking=True), y_lengths.to(device, non_blocking=True)
+    speakers = speakers.to(device, non_blocking=True)
 
-    with autocast(enabled=hps.train.fp16_run):
+    with autocast(enabled=USE_AMP, device_type=device.type):
       y_hat, l_length, attn, ids_slice, x_mask, z_mask,\
       (z, z_p, m_p, logs_p, m_q, logs_q) = net_g(x, x_lengths, spec, spec_lengths, speakers)
 
@@ -204,7 +266,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
 
       # Discriminator
       y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
-      with autocast(enabled=False):
+      with autocast(enabled=False, device_type=device.type):
         loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(y_d_hat_r, y_d_hat_g)
         loss_disc_all = loss_disc
     optim_d.zero_grad()
@@ -213,10 +275,10 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
     grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
     scaler.step(optim_d)
 
-    with autocast(enabled=hps.train.fp16_run):
+    with autocast(enabled=USE_AMP, device_type=device.type):
       # Generator
       y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
-      with autocast(enabled=False):
+      with autocast(enabled=False, device_type=device.type):
         loss_dur = torch.sum(l_length.float())
         loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
         loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
@@ -259,11 +321,11 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
           scalars=scalar_dict)
 
       if global_step % hps.train.eval_interval == 0:
-        evaluate(hps, net_g, eval_loader, writer_eval)
-        
+        evaluate(hps, net_g, eval_loader, writer_eval, device)
+
         utils.save_checkpoint(net_g, None, hps.train.learning_rate, epoch,
                               os.path.join(hps.model_dir, "G_latest.pth"))
-        
+
         utils.save_checkpoint(net_d, None, hps.train.learning_rate, epoch,
                               os.path.join(hps.model_dir, "D_latest.pth"))
         # save to google drive
@@ -302,32 +364,36 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                   print(f"remove {old_d}")
                   os.remove(old_d)
     global_step += 1
-    if epoch > hps.max_epochs:
-        print("Maximum epoch reached, closing training...")
-        exit()
 
   if rank == 0:
     logger.info('====> Epoch: {}'.format(epoch))
 
 
-def evaluate(hps, generator, eval_loader, writer_eval):
+def evaluate(hps, generator, eval_loader, writer_eval, device):
     generator.eval()
     with torch.no_grad():
-      for batch_idx, (x, x_lengths, spec, spec_lengths, y, y_lengths, speakers) in enumerate(eval_loader):
-        x, x_lengths = x.cuda(0), x_lengths.cuda(0)
-        spec, spec_lengths = spec.cuda(0), spec_lengths.cuda(0)
-        y, y_lengths = y.cuda(0), y_lengths.cuda(0)
-        speakers = speakers.cuda(0)
-
-        # remove else
-        x = x[:1]
-        x_lengths = x_lengths[:1]
-        spec = spec[:1]
-        spec_lengths = spec_lengths[:1]
-        y = y[:1]
-        y_lengths = y_lengths[:1]
-        speakers = speakers[:1]
+      batch = None
+      for batch_idx, batch in enumerate(eval_loader):
         break
+      if batch is None:
+        print("Validation set is empty, skipping evaluation.")
+        generator.train()
+        return
+      x, x_lengths, spec, spec_lengths, y, y_lengths, speakers = batch
+      x, x_lengths = x.to(device), x_lengths.to(device)
+      spec, spec_lengths = spec.to(device), spec_lengths.to(device)
+      y, y_lengths = y.to(device), y_lengths.to(device)
+      speakers = speakers.to(device)
+
+      # remove else
+      x = x[:1]
+      x_lengths = x_lengths[:1]
+      spec = spec[:1]
+      spec_lengths = spec_lengths[:1]
+      y = y[:1]
+      y_lengths = y_lengths[:1]
+      speakers = speakers[:1]
+
       y_hat, attn, mask, *_ = generator.module.infer(x, x_lengths, speakers, max_len=1000)
       y_hat_lengths = mask.sum([1,2]).long() * hps.data.hop_length
 

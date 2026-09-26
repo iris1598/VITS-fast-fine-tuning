@@ -10,6 +10,9 @@ from scipy.io.wavfile import read
 import torch
 import regex as re
 
+from compat import torch_load
+from audio_io import load_audio
+
 MATPLOTLIB_FLAG = False
 
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
@@ -147,7 +150,7 @@ def tag_cke(text,prev_sentence=None):
 
 def load_checkpoint(checkpoint_path, model, optimizer=None, drop_speaker_emb=False):
     assert os.path.isfile(checkpoint_path)
-    checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
+    checkpoint_dict = torch_load(checkpoint_path, map_location='cpu')
     iteration = checkpoint_dict['iteration']
     learning_rate = checkpoint_dict['learning_rate']
     if optimizer is not None:
@@ -211,6 +214,11 @@ def extract_digits(f):
 
 def latest_checkpoint_path(dir_path, regex="G_[0-9]*.pth"):
     f_list = glob.glob(os.path.join(dir_path, regex))
+    if not f_list:
+        raise FileNotFoundError(
+            f"No checkpoint matching {regex!r} found in {dir_path!r}. "
+            "Train a model first, or make sure the checkpoint files are in place."
+        )
     f_list.sort(key=lambda f: extract_digits(f))
     x = f_list[-1]
     print(f"latest_checkpoint_path:{x}")
@@ -227,6 +235,20 @@ def oldest_checkpoint_path(dir_path, regex="G_[0-9]*.pth", preserved=4):
     return ""
 
 
+def _figure_to_rgb_array(fig):
+    """Render a matplotlib figure to an HWC uint8 RGB array.
+
+    matplotlib removed ``FigureCanvasAgg.tostring_rgb`` in 3.10 and NumPy
+    removed the binary mode of ``np.fromstring`` in 2.0, so the classic
+    ``np.fromstring(canvas.tostring_rgb(), sep='')`` recipe no longer works.
+    ``buffer_rgba()`` is the supported replacement and is available on the Agg
+    backend that we force below.
+    """
+    fig.canvas.draw()
+    rgba = np.asarray(fig.canvas.buffer_rgba())
+    return np.ascontiguousarray(rgba[:, :, :3])
+
+
 def plot_spectrogram_to_numpy(spectrogram):
     global MATPLOTLIB_FLAG
     if not MATPLOTLIB_FLAG:
@@ -236,7 +258,6 @@ def plot_spectrogram_to_numpy(spectrogram):
         mpl_logger = logging.getLogger('matplotlib')
         mpl_logger.setLevel(logging.WARNING)
     import matplotlib.pylab as plt
-    import numpy as np
 
     fig, ax = plt.subplots(figsize=(10, 2))
     im = ax.imshow(spectrogram, aspect="auto", origin="lower",
@@ -246,10 +267,8 @@ def plot_spectrogram_to_numpy(spectrogram):
     plt.ylabel("Channels")
     plt.tight_layout()
 
-    fig.canvas.draw()
-    data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
-    data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-    plt.close()
+    data = _figure_to_rgb_array(fig)
+    plt.close(fig)
     return data
 
 
@@ -262,7 +281,6 @@ def plot_alignment_to_numpy(alignment, info=None):
         mpl_logger = logging.getLogger('matplotlib')
         mpl_logger.setLevel(logging.WARNING)
     import matplotlib.pylab as plt
-    import numpy as np
 
     fig, ax = plt.subplots(figsize=(6, 4))
     im = ax.imshow(alignment.transpose(), aspect='auto', origin='lower',
@@ -275,16 +293,19 @@ def plot_alignment_to_numpy(alignment, info=None):
     plt.ylabel('Encoder timestep')
     plt.tight_layout()
 
-    fig.canvas.draw()
-    data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
-    data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-    plt.close()
+    data = _figure_to_rgb_array(fig)
+    plt.close(fig)
     return data
 
 
 def load_wav_to_torch(full_path):
-    sampling_rate, data = read(full_path)
-    return torch.FloatTensor(data.astype(np.float32)), sampling_rate
+    """Legacy helper kept for API compatibility.
+
+    Returns ``(FloatTensor[T], sampling_rate)`` with samples in [-1, 1] — the
+    same contract as the old ``scipy.io.wavfile.read`` based implementation.
+    """
+    wav, sampling_rate = load_audio(full_path, mono=False)
+    return wav.mean(dim=0).float(), sampling_rate
 
 
 def load_filepaths_and_text(filename, split="|"):
@@ -370,7 +391,7 @@ def get_hparams_from_file(config_path):
 def check_git_hash(model_dir):
     source_dir = os.path.dirname(os.path.realpath(__file__))
     if not os.path.exists(os.path.join(source_dir, ".git")):
-        logger.warn("{} is not a git repository, therefore hash value comparison will be ignored.".format(
+        logger.warning("{} is not a git repository, therefore hash value comparison will be ignored.".format(
             source_dir
         ))
         return
@@ -381,7 +402,7 @@ def check_git_hash(model_dir):
     if os.path.exists(path):
         saved_hash = open(path).read()
         if saved_hash != cur_hash:
-            logger.warn("git hash values are different. {}(saved) != {}(current)".format(
+            logger.warning("git hash values are different. {}(saved) != {}(current)".format(
                 saved_hash[:8], cur_hash[:8]))
     else:
         open(path, "w").write(cur_hash)

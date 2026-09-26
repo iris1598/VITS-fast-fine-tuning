@@ -27,10 +27,9 @@ import utils
 from models import SynthesizerTrn
 import torch
 from torch import no_grad, LongTensor
-import librosa
+from audio_io import save_audio
 from text import text_to_sequence, _clean_text
 import commons
-import scipy.io.wavfile as wavf
 import os
 
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -104,6 +103,11 @@ if __name__ == "__main__":
 
     if language is not None:
         text = language_marks[language] + text + language_marks[language]
+        if spk not in speaker_ids:
+            raise KeyError(
+                f"Speaker {spk!r} is not in the model config. "
+                f"Available speakers: {list(speaker_ids.keys())}"
+            )
         speaker_id = speaker_ids[spk]
         stn_tst = get_text(text, hps, False)
         with no_grad():
@@ -114,7 +118,9 @@ if __name__ == "__main__":
                                 length_scale=1.0 / length)[0][0, 0].data.cpu().float().numpy()
         del stn_tst, x_tst, x_tst_lengths, sid
 
-        wavf.write(str(output_dir)+"/"+output_name+".wav",hps.data.sampling_rate,audio)
+        out_path = str(output_dir) + "/" + output_name + ".wav"
+        save_audio(out_path, audio, hps.data.sampling_rate)
+        print(f"Wrote {out_path}")
     
 
     
